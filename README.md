@@ -1,2 +1,0 @@
-# astrbot_plugin_proactive_reply
-能让官方bot主动发消息回复
