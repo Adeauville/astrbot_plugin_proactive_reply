@@ -15,12 +15,15 @@ desc: |-
   - 免打扰时间段（格式 "22:00-9:00"，支持跨天）；免打扰时段内可分别控制「自主回复」与「@回复」是否放行；
   - 插件运行日志收集（写入 AstrBot 日志 logs/astrbot.log 便于统一查看，插件目录另保留最近 3 份文件日志）；
     内置防重复机制，避免对同一条消息重复回复；
+  - v1.7.0 起接通 on_llm_request / on_llm_response 钩子链：
+    lili_state 等通过钩子注入人设/状态的插件现在能正常作用于本插件发出的请求，
+    群聊自主回复不再丢失人设；钩子不可用时自动降级为旧行为。
 
   管理指令：
   - /autoreply_status   查看当前状态与配置摘要
   - /autoreply_log 行数 查看最近 N 行插件日志（默认 30 行）
 author: Doubao
-version: 1.6.0
+version: 1.7.5
 repo: https://github.com/AstrBotDevs/AstrBot
 support_platforms:
   - qq_official

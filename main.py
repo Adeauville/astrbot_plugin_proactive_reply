@@ -11,7 +11,10 @@ astrbot_plugin_proactive_reply —— AstrBot 智能自主回复插件
 7. 群聊回复末尾附带被回复人昵称（可开关）；
 8. 插件运行日志收集（滚动文件日志 + AstrBot 控制台日志），便于后期排查问题。
 
-说明：本插件不注入人设/系统提示词，人设由其他插件或模型提供商配置控制。
+说明：v1.7.0 起，本插件在自行调用 LLM 前后会手动触发 AstrBot 的
+on_llm_request / on_llm_response 钩子链，因此 lili_state 等通过
+@on_llm_request 注入人设/状态的插件现在能正常作用于本插件发出的请求。
+钩子不可用时自动降级为旧行为（不触发钩子），不影响基本功能。
 依赖：无第三方依赖，仅使用 Python 标准库与 AstrBot 官方 API。
 """
 
@@ -42,6 +45,24 @@ try:
 except Exception:  # pragma: no cover
     astr_logger = logging.getLogger("astrbot_plugin_proactive_reply")
 
+# ---------------------------------------------------------------------------
+# 兼容导入：手动触发 on_llm_request / on_llm_response 钩子链。
+# 这样 lili_state 等「人设/状态管理」插件就能像在主 pipeline 里一样，
+# 在我们自己调 LLM 之前注入 system_prompt，并在拿到回复后更新状态。
+# 导入失败（旧版本 AstrBot 或内部路径变动）时静默降级为原行为：不触发钩子。
+# ---------------------------------------------------------------------------
+try:
+    from astrbot.core.pipeline.context_utils import call_event_hook
+    from astrbot.core.star.star_handler import EventType
+    from astrbot.core.provider.entities import ProviderRequest, LLMResponse
+    _HOOKS_AVAILABLE = True
+except Exception:  # pragma: no cover
+    call_event_hook = None
+    EventType = None
+    ProviderRequest = None
+    LLMResponse = None
+    _HOOKS_AVAILABLE = False
+
 PLUGIN_DIR = Path(__file__).resolve().parent
 LOG_DIR = PLUGIN_DIR / "logs"
 LOG_FILE = LOG_DIR / "auto_reply.log"
@@ -54,23 +75,22 @@ LOG_FILE = LOG_DIR / "auto_reply.log"
 # 避免把正在继续的对话误判为无关（漏回），同时避免对意思差不多的消息重复回复。
 # 特别要求模型「不要输出判断过程/确认文字」，防止判定结果被当作回复发出去。
 DEFAULT_CONTEXT_JUDGE_INSTRUCTION = (
-    "\n\n[对话延续判断] 请判断上面「当前消息」是否是在与你（机器人）继续对话。"
-    "不要输出任何判断过程、确认文字或解释，直接按以下规则执行："
-    "以下情况必须正常回复用户（即直接说出回复内容）："
-    "1) 消息点名或提到你；"
-    "2) 消息延续之前与你聊过的话题，包括回应你刚才的回答、补充说明、追问或反馈；"
-    "3) 消息来自刚刚被你回复过的人；"
-    "4) 消息中含有新的问题、新的信息，或需要你参与的新话题。"
-    "以下情况应拒绝回复（只输出 __NO_REPLY__ 五个字符，不要输出任何其他内容）："
-    "a) 该消息与你刚回复过的消息是在重复同一件事（同样的提问、同样的内容再说一遍），"
-    "没有新的信息；"
-    "b) 该消息明显是其他群友之间与你完全无关的闲聊"
-    "（既没有提到你，也与你之前说过的话没有关系）。"
-    "除上述拒绝情况外，一律正常回复用户。"
-    "重要：你的输出就是直接说给用户听的话。如果你输出的内容是判断过程的描述"
-    "（例如「是，是在与你继续对话」「这条消息点名了我」「属于明确与你互动的新问题」"
-    "「根据判断规则，…」这类文字），那属于违规输出，必须删除这些内容，"
-    "直接用自然语言回答用户。"
+    "\n\n[群聊插话判断] 你是这个群的群友之一，现在判断上面这条「当前消息」你要不要插嘴说话。"
+    "规则：\n"
+    "【必须直接接话】（直接说出你要说的话）：\n"
+    "1) 消息点名你、@你、直接问你；\n"
+    "2) 这条消息是在回应你之前说过的话（接你的梗、答你的问题、跟你抬杠）；\n"
+    "3) 发消息的人是你刚刚才回复过的，他在接着跟你聊。\n"
+    "【可以选择性加入】（只有你确实有话想说、有观点想发表时才开口）：\n"
+    "4) 群里在聊一个开放的、大家都能参与的话题（比如某部作品、某款游戏、某个热点），"
+    "而且你作为群友也有独特看法或好玩的梗可以抛出来——这种情况下用你自己的人设语气自然加入。\n"
+    "【一律不要插嘴】（只输出 __NO_REPLY__ 五个字符）：\n"
+    "a) 这是两个人之间的一问一答、短对话回合（比如 A 问「在干嘛」B 答「在玩游戏」，"
+    "这种一来一回的私聊式对话你不要插嘴）；\n"
+    "b) 消息明显是回复某一个特定的人，跟你没关系；\n"
+    "c) 话题跟你八竿子打不着，你也没什么自然可说的；\n"
+    "d) 你不确定该不该说话时——默认不回。\n"
+    "重要：你的输出就是直接说给群友听的话，不要输出任何判断过程、理由、「我应该/不应该」之类的元叙述。"
 )
 
 # 常见的「判定确认文本」模式：模型没有给出真实回复、而是回答判断结论
@@ -116,8 +136,8 @@ _LOG_FORMAT = "%(asctime)s | %(levelname)s | %(message)s"
 @register(
     "astrbot_plugin_proactive_reply",
     "Doubao",
-    "智能自主回复插件：上下文延续判断、关键词触发、免打扰时段、独立开关与运行日志",
-    "1.6.0",
+    "智能自主回复插件：上下文延续判断、关键词触发、免打扰时段、独立开关与运行日志（v1.7.5 不插嘴别人的@对话）",
+    "1.7.5",
     "https://github.com/AstrBotDevs/AstrBot",
 )
 class ProactiveReplyPlugin(Star):
@@ -245,8 +265,12 @@ class ProactiveReplyPlugin(Star):
             self._remember_msg(umo, text)
 
             is_at_me = self._is_at_me(event)
+            has_at_other = is_group and (not is_at_me) and self._has_at_other(event)
             if is_group and is_at_me:
                 self._log("INFO", "群聊消息命中 @ 机器人")
+            if has_at_other:
+                self._log("INFO", "群聊消息 @ 了别人，bot 不插嘴，跳过自主回复")
+                return None
 
             # 私聊：记录会话最近活跃时间（用于「长时间未聊 → 主动问候」）
             if not is_group:
@@ -290,7 +314,7 @@ class ProactiveReplyPlugin(Star):
                     self._log("INFO", "检测到延续信号（刚回复过该用户），直接继续回复")
                 if hit_keyword and not is_at_me:
                     self._log("INFO", "命中关键词，按触发规则直接回复")
-                reply, status = await self._llm_chat(umo, msgs, need_context_judge=need_judge)
+                reply, status = await self._llm_chat(event, umo, msgs, need_context_judge=need_judge)
 
                 if status == "no_reply":
                     self._log("INFO", "上下文延续判断：该消息与机器人对话无关，不回复")
@@ -599,6 +623,23 @@ class ProactiveReplyPlugin(Star):
             pass
         return False
 
+    def _has_at_other(self, event: AstrMessageEvent) -> bool:
+        """判断群聊消息里是否 @ 了别人（不是 @ 机器人自己）。
+
+        这种消息是群友之间在对话，bot 不应插嘴。
+        """
+        msg_obj = event.message_obj
+        self_id = str(getattr(msg_obj, "self_id", "") or "")
+        chain = getattr(msg_obj, "message", None) or []
+        for comp in chain:
+            if isinstance(comp, At):
+                qq = str(getattr(comp, "qq", "") or "")
+                if not qq or qq in ("all", "0", "-1"):
+                    continue
+                if qq != self_id:
+                    return True
+        return False
+
     # ------------------------------------------------------------------ #
     # 会话记忆
     # ------------------------------------------------------------------ #
@@ -662,23 +703,28 @@ class ProactiveReplyPlugin(Star):
         recent.append((text, time.time()))
 
     # ------------------------------------------------------------------ #
-    # LLM 调用（新旧两套 API 兼容；不注入人设/系统提示词）
+    # LLM 调用（新旧两套 API 兼容；v1.7.0 起接通 on_llm_request/response 钩子链）
     # ------------------------------------------------------------------ #
     async def _llm_chat(
-        self, umo: str, messages: list[dict], need_context_judge: bool = False
+        self,
+        event: AstrMessageEvent,
+        umo: str,
+        messages: list[dict],
+        need_context_judge: bool = False,
     ) -> tuple[Optional[str], str]:
         """调用 AstrBot 的 LLM 能力生成回复。
 
         历史消息以明文拼入 prompt（[之前的对话]...），不依赖 provider 的
         contexts 参数，确保任何提供商都能真正收到上下文（修复“聊久了不接话”）。
 
+        v1.7.0：在调用 provider 前后手动触发 on_llm_request / on_llm_response
+        钩子，让 lili_state 等通过钩子注入人设/维护状态的插件正常生效。
+
         返回 (回复文本, 状态)。状态取值：
         - "ok"：正常回复；
         - "no_reply"：上下文延续判断为「与机器人无关/重复话题/判定确认文本」；
         - "empty"：模型返回了空文本；
         - "failed"：LLM 调用失败或未找到提供商。
-
-        说明：本插件不传 system_prompt，人设由其他插件或模型提供商配置控制。
         """
         prov = None
 
@@ -724,13 +770,111 @@ class ProactiveReplyPlugin(Star):
                 judge = DEFAULT_CONTEXT_JUDGE_INSTRUCTION
             prompt_text = prompt_text + judge
 
+        # ---- v1.7.4：触发 on_llm_request 钩子链，注入人设/状态 ----
+        # 注意点：
+        # 1. call_event_hook 内部会用 event.plugins_name 做插件白名单过滤，
+        #    从本插件内部触发时 event.plugins_name 通常只包含当前插件名，
+        #    会把 lili_state / master_aware 等插件的 handler 过滤掉，因此临时放开为 ["*"]。
+        # 2. 各插件注入方式不同：
+        #    - lili_state 直接改写 req.prompt（人设前缀拼在用户消息前）
+        #    - master_aware 往 req.extra_user_content_parts 追加临时内容块
+        #    - 其他插件可能改 req.system_prompt / req.contexts 等
+        #    因此钩子跑完后必须把整个 req 对象传给 provider，不能只取 prompt/system_prompt。
+        # 3. v1.7.4：加载 AstrBot 原生 conversation 历史到 req.contexts，
+        #    这样 bot 能记得本插件安装之前就存在的对话上下文。
+        final_req = None
+        hook_stopped = False
+        _old_plugins_name = None
+        if _HOOKS_AVAILABLE and event is not None:
+            try:
+                _old_plugins_name = getattr(event, "plugins_name", None)
+                try:
+                    event.plugins_name = ["*"]
+                except Exception:
+                    pass
+
+                req = ProviderRequest(
+                    prompt=prompt_text,
+                    system_prompt="",
+                    session_id=umo or "",
+                )
+
+                # 加载 AstrBot 原生会话历史（包含插件安装前的对话）
+                try:
+                    conv_mgr = getattr(self.context, "conversation_manager", None)
+                    if conv_mgr is not None and umo:
+                        cid = await conv_mgr.get_curr_conversation_id(umo)
+                        if not cid:
+                            cid = await conv_mgr.new_conversation(
+                                umo, event.get_platform_id()
+                            )
+                        conv = await conv_mgr.get_conversation(umo, cid)
+                        if conv is not None:
+                            req.conversation = conv
+                            import json as _json
+                            req.contexts = _json.loads(conv.history or "[]")
+                            self._log(
+                                "INFO",
+                                f"已加载原生会话历史：{len(req.contexts)} 条消息",
+                            )
+                except Exception as e:
+                    self._log("DEBUG", f"加载原生会话历史失败（不影响回复）：{e!r}")
+
+                stopped = await call_event_hook(
+                    event, EventType.OnLLMRequestEvent, req
+                )
+                if stopped:
+                    self._log("INFO", "on_llm_request 钩子要求终止本次请求")
+                    hook_stopped = True
+                else:
+                    final_req = req
+                    self._log(
+                        "INFO",
+                        f"on_llm_request 钩子执行完毕：prompt {len(req.prompt or '')} 字"
+                        + f"，system_prompt {len(req.system_prompt or '')} 字"
+                        + f"，extra_parts {len(req.extra_user_content_parts or [])} 个"
+                        + f"，contexts {len(req.contexts or [])} 条",
+                    )
+            except Exception as e:
+                # 钩子异常不能阻断回复主流程，降级为不带人设继续
+                self._log("WARNING", f"触发 on_llm_request 钩子异常，已跳过：{e!r}")
+                final_req = None
+            finally:
+                try:
+                    event.plugins_name = _old_plugins_name
+                except Exception:
+                    pass
+
+        if hook_stopped:
+            return None, "no_reply"
+
         # 旧版 text_chat 路径
         try:
             resp = await asyncio.wait_for(
-                self._call_text_chat(prov, prompt_text),
+                self._call_text_chat(prov, prompt_text, final_req=final_req),
                 timeout=120,
             )
             text = self._extract_completion(resp)
+
+            # ---- v1.7.1：触发 on_llm_response 钩子链，更新人设插件状态 ----
+            if _HOOKS_AVAILABLE and event is not None:
+                try:
+                    try:
+                        event.plugins_name = ["*"]
+                    except Exception:
+                        pass
+                    fake_resp = LLMResponse(role="assistant", completion_text=text or "")
+                    await call_event_hook(
+                        event, EventType.OnLLMResponseEvent, fake_resp
+                    )
+                except Exception as e:
+                    self._log("WARNING", f"触发 on_llm_response 钩子异常，已跳过：{e!r}")
+                finally:
+                    try:
+                        event.plugins_name = _old_plugins_name
+                    except Exception:
+                        pass
+
             if not text:
                 self._log("WARNING", f"text_chat 未返回文本: role={getattr(resp, 'role', '?')}")
                 return None, "empty"
@@ -775,17 +919,58 @@ class ProactiveReplyPlugin(Star):
         parts.append("[当前消息]\n" + current_text)
         return "\n\n".join(parts)
 
-    async def _call_text_chat(self, prov: Any, prompt: str) -> Any:
+    async def _call_text_chat(
+        self, prov: Any, fallback_prompt: str, final_req: Any = None
+    ) -> Any:
         """按实际签名调用 provider.text_chat()。
 
-        历史已明文拼入 prompt，此处只传 prompt，不传 contexts，
-        避免不同 provider 对 contexts 处理不一致导致历史丢失或重复。
-        不传 system_prompt，人设交由其他插件/提供商配置。
+        v1.7.3：如果钩子链注入了 final_req（被 lili_state/master_aware 等插件
+        改写过的 ProviderRequest），则把 req 上所有可能被插件修改的字段
+        （prompt / system_prompt / extra_user_content_parts / session_id /
+        contexts / image_urls / audio_urls）完整传给 provider，确保所有
+        人设/认主插件的注入都生效，本插件只负责"自主回复决策"，不干涉内容。
         """
+        # 钩子没跑或失败时，退回裸调（仅传 prompt）
+        if final_req is None:
+            try:
+                return await prov.text_chat(prompt=fallback_prompt)
+            except TypeError:
+                return await prov.text_chat(fallback_prompt)
+
+        # 从被插件改写过的 req 里取所有字段
+        kwargs: dict[str, Any] = {
+            "prompt": final_req.prompt or fallback_prompt,
+            "system_prompt": (final_req.system_prompt or None),
+            "session_id": final_req.session_id or None,
+        }
+        if final_req.extra_user_content_parts:
+            kwargs["extra_user_content_parts"] = final_req.extra_user_content_parts
+        if final_req.contexts:
+            kwargs["contexts"] = final_req.contexts
+        if final_req.image_urls:
+            kwargs["image_urls"] = final_req.image_urls
+        if final_req.audio_urls:
+            kwargs["audio_urls"] = final_req.audio_urls
+
         try:
-            return await prov.text_chat(prompt=prompt)
+            return await prov.text_chat(**kwargs)
         except TypeError:
-            return await prov.text_chat(prompt)
+            # 个别 provider 不接受部分关键字参数，逐步剔除重试
+            for drop_key in (
+                "extra_user_content_parts",
+                "contexts",
+                "audio_urls",
+                "image_urls",
+                "session_id",
+                "system_prompt",
+            ):
+                kwargs.pop(drop_key, None)
+                try:
+                    return await prov.text_chat(**kwargs)
+                except TypeError:
+                    continue
+            # 最终兜底：只传 prompt
+            return await prov.text_chat(prompt=final_req.prompt or fallback_prompt)
 
     async def _llm_generate_new(
         self, umo: str, prompt: str, need_context_judge: bool
